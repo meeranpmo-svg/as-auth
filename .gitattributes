@@ -1,0 +1,5 @@
+# the server runs these: keep Linux line endings even when checked out on Windows (a CRLF install-ad.sh fails with
+# "set: pipefail: invalid option name")
+*.sh text eol=lf
+*.js text eol=lf
+*.md text eol=lf

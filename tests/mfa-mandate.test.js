@@ -73,6 +73,7 @@ const cfg = () => JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
 const log = () => fs.readFileSync(logFile, 'utf8');
 const whoami = async (cookies) => JSON.parse((await req('GET', '/auth/whoami', { cookies })).body);
 
+let SECOND;                                   // enrolladmin's TOTP session (set by the enrolled-user test): the second administrator
 let ADMIN;                                    // acquired once and reused: a TOTP code cannot be replayed within its 30s window
 async function adminSession() {               // poladmin is pre-enrolled and used by no other test
   if (ADMIN) return ADMIN;
@@ -163,6 +164,7 @@ test('enrolled user must pass TOTP; a correct code grants the session', async ()
   assert.equal(r2.status, 302); assert.ok(r2.cookies.as_session);
   const who = await whoami(r2.cookies);
   assert.equal(who.mfa, true); assert.equal(who.mfaState, 'enrolled'); assert.match(log(), /"event":"mfa-pass","user":"enrolladmin"/);
+  SECOND = r2.cookies;
 });
 
 test('wrong TOTP → mfa-fail audit + rate-limit: the account locks after repeated bad codes', async () => {
@@ -197,8 +199,22 @@ test('admin policy endpoint: set grace + toggle the mandate; config surfaces pol
   assert.equal(anon.status, 403);
   // bad grace value rejected
   assert.equal((await reqJson('/auth/admin/policy', { mfaGraceDays: -1 }, admin)).status, 400);
-  // turning the mandate OFF restores the legacy per-account policy: now mfa:"off" is admitted straight in...
-  assert.equal((await reqJson('/auth/admin/policy', { mfaRequired: false }, admin)).status, 200);
+  // turning the mandate OFF needs a second administrator (four-eyes): requesting it changes nothing yet...
+  const reqOff = await reqJson('/auth/admin/policy', { mfaRequired: false }, admin);
+  assert.equal(reqOff.status, 200); const pend = JSON.parse(reqOff.body);
+  assert.equal(pend.mfaRequired, true, 'still mandatory after the request'); assert.ok(pend.pending && pend.pending.id, 'a pending request is returned');
+  assert.equal((await req('POST', '/login', { form: { user: 'offuser', pass: 'Off-User-Pass-1' } })).status, 200, 'mandate still enforced while pending');
+  assert.match(log(), /"event":"mfa-change-requested","user":"poladmin".*mfaRequired → false/);
+  const listed = JSON.parse((await req('GET', '/auth/admin/config', { cookies: admin })).body).mfaChanges;
+  assert.ok(listed.some((c) => c.id === pend.pending.id && c.canApprove === false), 'the requester sees it but cannot approve');
+  // the requester cannot approve their own request; a reject needs a reason
+  assert.equal((await reqJson('/auth/admin/mfa-changes/' + pend.pending.id + '/approve', {}, admin)).status, 403);
+  assert.equal((await reqJson('/auth/admin/mfa-changes/' + pend.pending.id + '/reject', {}, SECOND)).status, 400);
+  assert.equal((await reqJson('/auth/admin/mfa-changes/000000000000/approve', {}, SECOND)).status, 404);
+  // ...a different administrator, signed in with TOTP, approves: now mfa:"off" is admitted straight in
+  const appr = await reqJson('/auth/admin/mfa-changes/' + pend.pending.id + '/approve', {}, SECOND);
+  assert.equal(appr.status, 200, appr.body); assert.equal(JSON.parse(appr.body).mfaRequired, false);
+  assert.match(log(), /"event":"mfa-change-approved","user":"enrolladmin".*by poladmin · approved by enrolladmin/);
   const off = await req('POST', '/login', { form: { user: 'offuser', pass: 'Off-User-Pass-1' } });
   assert.equal(off.status, 302, 'with the mandate off, mfa:"off" is exempt again'); assert.ok(off.cookies.as_session);
   // ...and turning it back ON re-mandates MFA for that same account

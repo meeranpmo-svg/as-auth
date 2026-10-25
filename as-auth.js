@@ -199,6 +199,30 @@ function mfaStatus(u) {
   return { state: 'grace', deadline: new Date(deadline).toISOString() };
 }
 function graceLeft(deadline) { if (!deadline) return graceDays(); const ms = Date.parse(deadline) - Date.now(); return ms <= 0 ? 0 : Math.ceil(ms / 86400000); }
+/* ─────────── four-eyes for weakening two-step verification ───────────
+   Switching the mandate off, lengthening the enrolment grace, a weaker legacy policy, or setting an account's MFA to 'off'
+   is only REQUESTED by one administrator; it takes effect when a DIFFERENT administrator approves it, from a session that
+   itself passed two-step verification (TOTP or the identity provider's MFA). Never a service or AI identity. A request
+   expires after 24 h and is applied against the settings as they are at approval. Strengthening changes apply at once. */
+const MFA_RANK = { optional: 0, admins: 1, all: 2 }, CHANGE_TTL = 24 * 3600e3;
+function isServiceId(u) { return /^(duty|system|ai|svc|service)[:_-]/i.test(String(u || '')); }
+function mfaChanges() { const t = Date.now(); CFG.mfaChanges = (CFG.mfaChanges || []).filter(function (c) { return c && Date.parse(c.expires) > t; }); return CFG.mfaChanges; }
+function mfaWeakening(b) {   /* the policy fields in b that would weaken two-step verification → {field: value} */
+  const w = {};
+  if (b.mfaRequired != null && !b.mfaRequired && mfaMandatory()) w.mfaRequired = false;
+  if (b.mfaGraceDays != null && Number(b.mfaGraceDays) > graceDays()) w.mfaGraceDays = Number(b.mfaGraceDays);
+  if (b.mfaPolicy != null && MFA_RANK[b.mfaPolicy] != null && MFA_RANK[b.mfaPolicy] < MFA_RANK[CFG.mfaPolicy || 'admins']) w.mfaPolicy = b.mfaPolicy;
+  return w;
+}
+function describeChange(c) { return c.kind === 'user-mfa-off' ? 'set MFA off for ' + c.target : Object.keys(c.changes).map(function (k) { return k + ' → ' + c.changes[k]; }).join(', '); }
+function requestMfaChange(kind, changes, target, sess, ip) {
+  const list = mfaChanges();
+  if (list.length >= 20) return null;
+  const c = { id: crypto.randomBytes(6).toString('hex'), kind: kind, changes: changes, target: target || null, by: sess.u, at: new Date().toISOString(), expires: new Date(Date.now() + CHANGE_TTL).toISOString() };
+  list.push(c); save();
+  audit({ event: 'mfa-change-requested', user: sess.u, ip: ip, reason: describeChange(c) + ' · request ' + c.id + ' · needs a second administrator' });
+  return c;
+}
 const ROLES = ['admin', 'operator', 'viewer'];
 function pwProblem(pw) { pw = String(pw || ''); if (pw.length < 10) return 'the password needs at least 10 characters'; if (!/[A-Za-z]/.test(pw) || !/\d/.test(pw)) return 'the password needs letters and digits'; return null; }
 function enabledAdmins(except) { return (CFG.users || []).filter(function (u) { return u.role === 'admin' && !u.disabled && u.user !== except; }).length; }
@@ -636,6 +660,7 @@ const server = http.createServer(function (req, res) {
         users: (CFG.users || []).map(function (u) { const ms = mfaStatus(u); return { user: u.user, name: u.name, role: u.role, mfa: !!u.totp, mfaSetting: u.mfa || 'policy', mfaRequired: mfaRequired(u), mfaState: ms.state, mfaGraceStart: u.mfaGraceStart || null, mfaDeadline: ms.deadline, disabled: !!u.disabled, created: u.created || null, createdBy: u.createdBy || null, mfaSince: u.mfaSince || null, recoveryLeft: (u.recovery || []).length, breakglass: !!u.breakglass, lastLogin: u.lastLogin || null, lastMethod: u.lastMethod || null, locked: locked(u.user), source: u.source || 'local', dn: u.dn || undefined, adBlocked: u.adBlocked || undefined }; }),
         ldap: (function () { const l = ldapCfg(); return { enabled: !!l.enabled, active: ldapOn(), servers: l.servers, caFile: l.caFile, baseDN: l.baseDN, bindDN: l.bindDN, hasBindPassword: !!l.bindPassword, netbios: l.netbios, upnSuffix: l.upnSuffix, userAttr: l.userAttr, groupRoles: l.groupRoles || {}, nested: l.nested !== false, requireMfa: l.requireMfa !== false }; })(),
         session: sessCfg(), sessionsActive: Object.keys(SIDS).length,
+        mfaChanges: mfaChanges().map(function (c) { return { id: c.id, kind: c.kind, changes: c.changes, target: c.target, by: c.by, at: c.at, expires: c.expires, summary: describeChange(c), canApprove: c.by !== sess.u && !!sess.mfa }; }),
         events: recentEvents(150), me: sess.u });
     }
     if (req.method === 'GET' && url === '/auth/admin/sessions') {   /* who is signed in now - never the tokens */
@@ -686,6 +711,31 @@ const server = http.createServer(function (req, res) {
         return discovery(true).then(function (d) { return jwks(true).then(function (k) { json(res, 200, { ok: true, issuer: d.issuer, authorization: d.authorization_endpoint, token: d.token_endpoint, keys: (k.keys || []).length, amrSupported: (d.claims_supported || []).indexOf('amr') >= 0 }); }); })
           .catch(function (e) { json(res, 502, { error: e.message }); });
       }
+      const cm = /^\/auth\/admin\/mfa-changes\/([a-f0-9]{12})\/(approve|reject)$/.exec(url);
+      if (cm) {
+        const c = mfaChanges().filter(function (x) { return x.id === cm[1]; })[0];
+        if (!c) return json(res, 404, { error: 'no such pending request (it may have expired after 24 h)' });
+        if (cm[2] === 'reject') {
+          const why = String(b.reason || '').trim().slice(0, 300); if (!why) return json(res, 400, { error: 'reason is required to reject' });
+          CFG.mfaChanges = mfaChanges().filter(function (x) { return x.id !== c.id; }); save();
+          audit({ event: 'mfa-change-rejected', user: sess.u, ip: ip, reason: describeChange(c) + ' · request ' + c.id + ' by ' + c.by + ' · ' + why });
+          return json(res, 200, { ok: true });
+        }
+        if (c.by === sess.u) return json(res, 403, { error: 'a different administrator must approve this - you requested it' });
+        if (isServiceId(sess.u)) return json(res, 403, { error: 'a service or AI identity cannot approve' });
+        if (!sess.mfa) return json(res, 403, { error: 'approve from a session signed in with two-step verification' });
+        if (c.kind === 'policy') {
+          if (c.changes.mfaRequired === false) CFG.mfaRequired = false;
+          if (c.changes.mfaGraceDays != null) CFG.mfaGraceDays = Math.floor(c.changes.mfaGraceDays);
+          if (c.changes.mfaPolicy != null) CFG.mfaPolicy = c.changes.mfaPolicy;
+        } else if (c.kind === 'user-mfa-off') {
+          const u = userOf(c.target); if (!u) { CFG.mfaChanges = mfaChanges().filter(function (x) { return x.id !== c.id; }); save(); return json(res, 404, { error: 'the account no longer exists' }); }
+          u.mfa = 'off'; delete u.totp; delete u.totpStep; delete u.recovery; delete u.mfaSince;
+        }
+        CFG.mfaChanges = mfaChanges().filter(function (x) { return x.id !== c.id; }); save();
+        audit({ event: 'mfa-change-approved', user: sess.u, ip: ip, reason: describeChange(c) + ' · request ' + c.id + ' by ' + c.by + ' · approved by ' + sess.u });
+        return json(res, 200, { ok: true, applied: describeChange(c), mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicy: CFG.mfaPolicy });
+      }
       if (url === '/auth/admin/sessions/revoke') {          /* {user} ends every session of that account, {id} one session (first 8 characters from the list) */
         const who = String(b.user || '').toLowerCase().trim(), id = String(b.id || '');
         if (!who && !/^[A-Za-z0-9_-]{8}$/.test(id)) return json(res, 400, { error: 'give user, or id (the 8-character session id from the list)' });
@@ -696,6 +746,14 @@ const server = http.createServer(function (req, res) {
         return json(res, n ? 200 : 404, n ? { ok: true, ended: n } : { error: 'no active session matched' });
       }
       if (url === '/auth/admin/policy') {
+        if (b.mfaGraceDays != null) { const n = Number(b.mfaGraceDays); if (!isFinite(n) || n < 0 || n > 3650) return json(res, 400, { error: 'mfaGraceDays must be a whole number of days between 0 and 3650' }); }
+        if (b.mfaPolicy != null && ['all', 'admins', 'optional'].indexOf(b.mfaPolicy) < 0) return json(res, 400, { error: 'MFA policy is all, admins or optional' });
+        const weak = mfaWeakening(b); let pending = null;
+        if (Object.keys(weak).length) {
+          pending = requestMfaChange('policy', weak, null, sess, ip);
+          if (!pending) return json(res, 429, { error: 'too many pending MFA change requests - approve or reject them first' });
+          Object.keys(weak).forEach(function (k) { delete b[k]; });
+        }
         if (b.mfaRequired != null) {
           const want = !!b.mfaRequired;
           if (want && !CFG.mfaPolicyActivated) CFG.mfaPolicyActivated = new Date().toISOString();   /* stamp when the mandate is (re)activated */
@@ -719,7 +777,8 @@ const server = http.createServer(function (req, res) {
           }
           CFG.localLogin = b.localLogin;
         }
-        save(); const sc = sessCfg(); audit({ event: 'config', user: sess.u, ip: ip, reason: 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin + ', idle ' + sc.idleMinutes + ' min, admin ' + sc.adminHours + ' h, SSO re-check ' + sc.ssoRecheckMinutes + ' min' }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin, session: sessCfg() });
+        save(); const sc = sessCfg(); audit({ event: 'config', user: sess.u, ip: ip, reason: 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin + ', idle ' + sc.idleMinutes + ' min, admin ' + sc.adminHours + ' h, SSO re-check ' + sc.ssoRecheckMinutes + ' min' }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin, session: sessCfg(),
+          pending: pending ? { id: pending.id, changes: pending.changes, expires: pending.expires, note: 'weakens two-step verification: takes effect when a different administrator approves it' } : undefined });
       }
       if (url === '/auth/admin/users') {                      /* create a local account */
         const name = String(b.user || '').toLowerCase().trim();
@@ -729,8 +788,9 @@ const server = http.createServer(function (req, res) {
         const bad = pwProblem(b.password); if (bad) return json(res, 400, { error: bad });
         if (b.mfa != null && ['on', 'off', 'policy'].indexOf(b.mfa) < 0) return json(res, 400, { error: 'MFA must be on, off or policy' });
         const salt = crypto.randomBytes(16).toString('hex'), u = { user: name, name: String(b.name || name).slice(0, 80), role: b.role, salt: salt, passHash: hashPw(b.password, salt), created: new Date().toISOString(), createdBy: sess.u };
-        if (b.mfa === 'on' || b.mfa === 'off') u.mfa = b.mfa; if (b.disabled) u.disabled = true;
+        if (b.mfa === 'on') u.mfa = b.mfa; if (b.disabled) u.disabled = true;
         CFG.users = CFG.users || []; CFG.users.push(u); save();
+        if (b.mfa === 'off') requestMfaChange('user-mfa-off', { mfa: 'off' }, name, sess, ip);   /* created with the policy; 'off' waits for a second admin */
         audit({ event: 'user-created', user: name, role: u.role, ip: ip, reason: 'by ' + sess.u + (u.mfa ? ' · MFA ' + u.mfa : '') });
         return json(res, 200, { ok: true });
       }
@@ -758,15 +818,16 @@ const server = http.createServer(function (req, res) {
           u.disabled = !!b.disabled; if (!u.disabled) delete u.disabled; changes.push(b.disabled ? 'disabled' : 'enabled');
         }
         if (b.password) { const bad = pwProblem(b.password); if (bad) return json(res, 400, { error: bad }); u.salt = crypto.randomBytes(16).toString('hex'); u.passHash = hashPw(b.password, u.salt); u.pwChanged = new Date().toISOString(); delete FAIL[u.user]; changes.push('password reset'); }
+        let mfaPending = null;
         if (b.mfa != null) {
           if (['on', 'off', 'policy'].indexOf(b.mfa) < 0) return json(res, 400, { error: 'MFA must be on, off or policy' });
-          if (b.mfa === 'policy') delete u.mfa; else u.mfa = b.mfa;
-          if (b.mfa === 'off') { delete u.totp; delete u.totpStep; delete u.recovery; delete u.mfaSince; }
-          changes.push('MFA ' + b.mfa);
+          if (b.mfa === 'off') { mfaPending = requestMfaChange('user-mfa-off', { mfa: 'off' }, u.user, sess, ip); if (!mfaPending) return json(res, 429, { error: 'too many pending MFA change requests - approve or reject them first' }); }
+          else { if (b.mfa === 'policy') delete u.mfa; else u.mfa = b.mfa; changes.push('MFA ' + b.mfa); }
         }
+        if (mfaPending && !changes.length) return json(res, 202, { ok: true, pending: { id: mfaPending.id, note: 'MFA off for ' + u.user + ' takes effect when a different administrator approves it' } });
         if (!changes.length) return json(res, 400, { error: 'nothing to change' });
         save(); if (u.disabled || b.password) endUserSessions(u.user, u.disabled ? 'account disabled' : 'password reset', sess.u);
-        audit({ event: 'user-updated', user: u.user, ip: ip, reason: changes.join(', ') + ' · by ' + sess.u }); return json(res, 200, { ok: true });
+        audit({ event: 'user-updated', user: u.user, ip: ip, reason: changes.join(', ') + ' · by ' + sess.u }); return json(res, 200, mfaPending ? { ok: true, pending: { id: mfaPending.id } } : { ok: true });
       }
       const m = /^\/auth\/admin\/users\/([a-z0-9._@-]+)\/(reset-mfa|unlock|breakglass)$/.exec(url);
       if (m) {

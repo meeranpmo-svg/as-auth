@@ -256,3 +256,19 @@ tokens are stored encrypted and never logged.
 Settings: `POST /auth/admin/policy {"session": {"idleMinutes": 30, "adminHours": 8, "ssoRecheckMinutes": 15, "ssoOutageMinutes": 60, "ssoNoRefreshMinutes": 60}}`
 (admin; each value is bounded and the change is audited). After the first install, sessions issued before it are not in the
 table: everyone signs in once more.
+
+## Second administrator for weakening two-step verification
+
+These changes are only **requested** by one administrator; they take effect when a **different** administrator approves:
+
+- switching the MFA mandate off (`mfaRequired: false`)
+- a longer enrolment grace (`mfaGraceDays` above the current value)
+- a weaker legacy policy (`mfaPolicy` all → admins → optional)
+- MFA "off" for an account (update, or create with `mfa: "off"`)
+
+The approver must be signed in with two-step verification (TOTP or the identity provider's MFA); the requester, an operator
+or a service / AI identity cannot approve. Pending requests are listed in `GET /auth/admin/config` (`mfaChanges`), approved
+with `POST /auth/admin/mfa-changes/<id>/approve` or rejected with `POST /auth/admin/mfa-changes/<id>/reject {"reason": "..."}`.
+A request expires after 24 hours. Request, approval and rejection are written to the sign-in log with both names.
+Strengthening changes (mandate on, a shorter grace, a stricter policy) apply at once. With only one enabled administrator a
+weakening change cannot be approved - by design.
