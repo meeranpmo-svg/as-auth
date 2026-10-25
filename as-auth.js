@@ -14,7 +14,10 @@
      disabled / expired / locked refused → bind as the user → role from mapped groups (nested via IN_CHAIN). The account
      then lives on as a local SHADOW record {source:"ad", dn, role, no password} so sessions, TOTP enrolment, throttling
      and audit are the same code paths as local accounts. The AD password is never stored or logged; the service-account
-     password is stored enc()-encrypted (as-auth-ldap.js --set-bind-password).                                               */
+     password is stored enc()-encrypted (as-auth-ldap.js --set-bind-password).
+   · Sessions — every session is also a server-side record (AS_AUTH_SESS), so sign-out, an admin revoke, an idle timeout or a
+     disabled account ends it at once; admin sessions are shorter; single sign-on sessions are re-checked with the identity
+     provider every few minutes (refresh-token grant) and end when the provider refuses them (see "server-side sessions"). */
 'use strict';
 const http = require('http'), https = require('https'), crypto = require('crypto'), fs = require('fs');
 const CFG_FILE = process.env.AS_AUTH_CFG || '/etc/arabianshield-auth.json', LOG_FILE = process.env.AS_AUTH_LOG || '/var/log/arabianshield-auth.log', PORT = +process.env.AS_AUTH_PORT || 9098;
@@ -53,17 +56,108 @@ function unsign(v) { if (!v) return null; const i = v.lastIndexOf('.'); if (i < 
 function cookie(hdr, name) { const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)').exec(hdr || ''); return m ? m[1] : null; }
 function setCookie(name, val, secs) { return name + '=' + val + '; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=' + secs; }
 function clearCookie(name) { return name + '=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'; }
-/* a local session is only valid while the account still exists and is enabled; its role follows the current account record */
+/* ─────────── server-side sessions ───────────
+   Every session also lives in a server-side table (sid → record), so it can END before its cookie does: sign-out, an admin's
+   revoke, an idle timeout, a disabled / deleted account, or - for single sign-on - the identity provider refusing it. A cookie
+   whose sid is not in the table is not a session (this also ends every cookie issued before the table existed: one new
+   sign-in after the upgrade). Single sign-on sessions are re-checked with the identity provider every CFG.session.
+   ssoRecheckMinutes (refresh-token grant, offline_access): a disabled / deleted / revoked account or a removed role ends the
+   session at the next check instead of up to CFG.hours later. An identity provider that cannot be reached is tolerated for
+   ssoOutageMinutes, then the session ends (fail closed). Without a refresh token an SSO session lasts ssoNoRefreshMinutes.
+   The table is kept in AS_AUTH_SESS (default next to the config, chmod 600); refresh tokens in it are enc()-encrypted and
+   never logged. */
+const SESS_FILE = process.env.AS_AUTH_SESS || CFG_FILE.replace(/\.json$/, '') + '.sessions.json';
+const SESSION_DEFAULTS = { idleMinutes: 60, adminHours: 8, ssoRecheckMinutes: 15, ssoOutageMinutes: 60, ssoNoRefreshMinutes: 60 };
+const SESSION_LIMITS = { idleMinutes: [5, 720], adminHours: [1, 24], ssoRecheckMinutes: [5, 60], ssoOutageMinutes: [0, 240], ssoNoRefreshMinutes: [15, 720] };
+function sessCfg() { const c = Object.assign({}, SESSION_DEFAULTS, CFG.session || {}); Object.keys(SESSION_LIMITS).forEach(function (k) { const n = Number(c[k]), l = SESSION_LIMITS[k]; c[k] = isFinite(n) ? Math.min(l[1], Math.max(l[0], Math.floor(n))) : SESSION_DEFAULTS[k]; }); return c; }
+let SIDS = {};
+try { SIDS = JSON.parse(fs.readFileSync(SESS_FILE, 'utf8')) || {}; } catch (e) { SIDS = {}; }   /* no table yet (first start) → no sessions */
+let SESS_TIMER = null;
+function saveSessions(now) {
+  const write = function () { SESS_TIMER = null; try { const tmp = SESS_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(SIDS), { mode: 0o600 }); fs.renameSync(tmp, SESS_FILE); } catch (e) { console.log('[as-auth] session table save failed: ' + e.message); } };
+  if (now) { if (SESS_TIMER) { clearTimeout(SESS_TIMER); SESS_TIMER = null; } return write(); }
+  if (!SESS_TIMER) { SESS_TIMER = setTimeout(write, 5000); if (SESS_TIMER.unref) SESS_TIMER.unref(); }
+}
+function pruneSessions() { const t = Date.now(); let n = 0; Object.keys(SIDS).forEach(function (k) { if (!SIDS[k] || SIDS[k].exp < t) { delete SIDS[k]; n++; } }); if (n) saveSessions(true); }
+setInterval(pruneSessions, 10 * 60e3).unref();
+function endSession(sid, reason, by) {
+  const r = SIDS[sid]; if (!r) return false; delete SIDS[sid]; saveSessions(true);
+  audit({ event: 'session-ended', user: r.u, method: r.m, reason: reason + (by ? ' · by ' + by : '') });
+  return true;
+}
+function endUserSessions(user, reason, by) { let n = 0; Object.keys(SIDS).forEach(function (k) { if (SIDS[k] && SIDS[k].u === user && endSession(k, reason, by)) n++; }); return n; }
+function ssoDue(sid) { const r = SIDS[sid]; return !!(r && r.m === 'sso' && Date.now() >= (r.chk || 0)); }
+/* a session is valid while its server-side record exists, it has not been idle too long and (local / AD) the account still
+   exists and is enabled; its role follows the current account record, or for SSO the role the identity provider last gave */
 function session(req) {
-  const s = unsign(cookie(req.headers.cookie, 'as_session')); if (!s) return null;
-  if (s.m === 'sso') return s;
+  const s = unsign(cookie(req.headers.cookie, 'as_session')); if (!s || !s.sid) return null;
+  const rec = SIDS[s.sid], t = Date.now(), sc = sessCfg();
+  if (!rec || rec.u !== s.u || rec.exp < t) return null;
+  if (t - (rec.last || rec.iat) > sc.idleMinutes * 60e3) { endSession(s.sid, 'idle for more than ' + sc.idleMinutes + ' min'); return null; }
+  if (t - (rec.last || 0) > 60e3) { rec.last = t; saveSessions(); }
+  if (s.m === 'sso') {
+    if (!ssoOn()) { endSession(s.sid, 'single sign-on switched off'); return null; }
+    s.r = rec.r || s.r;
+    if (ssoDue(s.sid)) ssoRecheck(s.sid);   /* in the background; /auth/verify waits for it */
+    return s;
+  }
   const u = (CFG.users || []).filter(function (x) { return x.user === s.u; })[0];
   if (!u || u.disabled) return null;
   if (u.source === 'ad' && (u.adBlocked || !ldapOn())) return null;   /* AD said no / directory sign-in switched off → sessions end */
   if (u.pwChanged && s.iat && s.iat < Date.parse(u.pwChanged)) return null;
-  s.r = u.role || s.r; s.name = u.name || s.name; return s;
+  s.r = u.role || s.r; s.name = u.name || s.name;
+  if (s.mfaPending) s.r = 'viewer';   /* enrolment grace: read-only until two-step verification is set up */
+  return s;
 }
-function makeSession(id) { return setCookie('as_session', signed(Object.assign({ iat: Date.now() }, id), HOURS * 60), HOURS * 3600); }
+function makeSession(id, extra) {
+  pruneSessions();
+  const t = Date.now(), sc = sessCfg(), hours = id.r === 'admin' ? Math.min(HOURS, sc.adminHours) : HOURS, sid = b64u(crypto.randomBytes(18));
+  const rec = { u: id.u, m: id.m, r: id.r, iat: t, last: t, exp: t + hours * 3600e3, ip: (extra && extra.ip) || '' };
+  if (id.m === 'sso') { rec.sub = (extra && extra.sub) || ''; rec.rt = extra && extra.rt ? enc(extra.rt) : ''; rec.chk = t + (rec.rt ? sc.ssoRecheckMinutes : sc.ssoNoRefreshMinutes) * 60e3; }
+  SIDS[sid] = rec; saveSessions(true);
+  return setCookie('as_session', signed(Object.assign({ iat: t, sid: sid }, id), hours * 60), hours * 3600);
+}
+/* the single sign-on re-check: refresh-token grant at the identity provider. A refusal (4xx: invalid_grant - account disabled,
+   deleted, password reset, sessions revoked - or interaction_required) or a role no longer granted ends the session at once;
+   an outage is tolerated for ssoOutageMinutes, re-tried every minute, then the session ends. One check per session at a time. */
+const RECHECK = {};
+function ssoRecheck(sid) {
+  if (RECHECK[sid]) return RECHECK[sid];
+  const rec = SIDS[sid]; if (!rec) return Promise.resolve(false);
+  const sc = sessCfg(), t0 = Date.now();
+  const p = (async function () {
+    if (!rec.rt) { endSession(sid, 'single sign-on session reached ' + sc.ssoNoRefreshMinutes + ' min without a refresh token - sign in again'); return false; }
+    const rt = dec(rec.rt); if (!rt) { endSession(sid, 'stored refresh token unreadable'); return false; }
+    try {
+      const d = await discovery();
+      const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rt, client_id: CFG.sso.clientId, scope: ssoScopes() });
+      const secret = CFG.sso.clientSecret ? dec(CFG.sso.clientSecret) : null; if (secret) body.set('client_secret', secret);
+      const tk = await httpsJSON(d.token_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, body.toString());
+      if (!SIDS[sid]) return false;                                   /* signed out while we asked */
+      if (tk.id_token) {
+        const c = await verifyIdToken(tk.id_token, null, { refresh: true });
+        if (rec.sub && c.sub !== rec.sub) { endSession(sid, 'identity provider returned a different subject'); return false; }
+        const role = mapRole(c);
+        if (!role) { endSession(sid, 'role no longer granted by the identity provider'); return false; }
+        if (role !== rec.r) { audit({ event: 'role-changed', user: rec.u, role: role, method: 'sso', reason: rec.r + ' → ' + role + ' (identity provider)' }); rec.r = role; }
+      }
+      if (tk.refresh_token) rec.rt = enc(tk.refresh_token);
+      delete rec.fail; rec.chk = Date.now() + sc.ssoRecheckMinutes * 60e3; saveSessions();
+      return true;
+    } catch (e) {
+      if (e.status >= 400 && e.status < 500) { endSession(sid, 'identity provider refused the session (' + String(e.oauth || e.status) + ')'); return false; }
+      if (!SIDS[sid]) return false;
+      rec.fail = rec.fail || t0;
+      if (Date.now() - rec.fail >= sc.ssoOutageMinutes * 60e3) { endSession(sid, 'identity provider could not be reached for ' + sc.ssoOutageMinutes + ' min (' + String(e.message).slice(0, 120) + ')'); return false; }
+      rec.chk = Date.now() + 60e3; saveSessions();
+      if (!rec.warned) { rec.warned = 1; audit({ event: 'sso-recheck-error', user: rec.u, method: 'sso', reason: String(e.message).slice(0, 200) + ' - retrying; the session ends after ' + sc.ssoOutageMinutes + ' min' }); }
+      return true;
+    }
+  })();
+  RECHECK[sid] = p;
+  return p.then(function (v) { delete RECHECK[sid]; return v; }, function (e) { delete RECHECK[sid]; console.log('[as-auth] SSO re-check failed: ' + e.message); endSession(sid, 'SSO re-check failed'); return false; });
+}
+function ssoScopes() { const s = String(CFG.sso.scopes || 'openid profile email'); return /\boffline_access\b/.test(s) ? s : s + ' offline_access'; }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
 function json(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); }
 function readBody(req, cb) { let b = ''; req.on('data', function (c) { b += c; if (b.length > 65536) req.destroy(); }); req.on('end', function () { cb(b); }); }
@@ -245,7 +339,7 @@ function httpsJSON(url, opts, body) {
     if (u.protocol !== 'https:') return reject(new Error('the identity provider must use HTTPS'));
     const req = https.request({ method: (opts && opts.method) || 'GET', hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, headers: Object.assign({ Accept: 'application/json' }, (opts && opts.headers) || {}), timeout: 10000 }, function (res) {
       let d = ''; res.on('data', function (c) { d += c; if (d.length > 2e6) req.destroy(); });
-      res.on('end', function () { let j; try { j = JSON.parse(d); } catch (e) { return reject(new Error('invalid response from ' + u.hostname)); } if (res.statusCode >= 400) return reject(new Error(String(j.error_description || j.error || ('HTTP ' + res.statusCode)).slice(0, 300))); resolve(j); });
+      res.on('end', function () { let j; try { j = JSON.parse(d); } catch (e) { return reject(new Error('invalid response from ' + u.hostname)); } if (res.statusCode >= 400) return reject(Object.assign(new Error(String(j.error_description || j.error || ('HTTP ' + res.statusCode)).slice(0, 300)), { status: res.statusCode, oauth: String(j.error || '').slice(0, 60) })); resolve(j); });
     });
     req.on('timeout', function () { req.destroy(new Error('identity provider timeout')); }); req.on('error', reject);
     if (body) req.write(body); req.end();
@@ -268,7 +362,7 @@ function jwkToPem(k) {
   const spki = der(0x30, Buffer.concat([algo, der(0x03, Buffer.concat([Buffer.from([0]), rsaKey]))]));
   return '-----BEGIN PUBLIC KEY-----\n' + spki.toString('base64').match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----\n';
 }
-async function verifyIdToken(tok, nonce) {
+async function verifyIdToken(tok, nonce, opts) {   /* opts.refresh: a token from the refresh-token grant carries no new nonce */
   const parts = String(tok || '').split('.'); if (parts.length !== 3) throw new Error('malformed id_token');
   const h = JSON.parse(ub64u(parts[0]).toString()), p = JSON.parse(ub64u(parts[1]).toString());
   if (h.alg !== 'RS256') throw new Error('unsupported token algorithm ' + h.alg);
@@ -281,7 +375,7 @@ async function verifyIdToken(tok, nonce) {
   if (!(p.aud === CFG.sso.clientId || (Array.isArray(p.aud) && p.aud.indexOf(CFG.sso.clientId) >= 0))) throw new Error('audience mismatch');
   if (!p.exp || p.exp < now - 60) throw new Error('id_token expired');
   if (p.nbf && p.nbf > now + 60) throw new Error('id_token not yet valid');
-  if (p.nonce !== nonce) throw new Error('nonce mismatch');
+  if (!(opts && opts.refresh) && p.nonce !== nonce) throw new Error('nonce mismatch');
   return p;
 }
 function mapRole(claims) {
@@ -365,7 +459,7 @@ function finish(res, u, method, mfa, ip) {
   method = methodFor(u, method);
   u.lastLogin = new Date().toISOString(); u.lastMethod = method; try { save(); } catch (e) {}
   audit({ event: 'sign-in', user: u.user, role: u.role, method: method, mfa: !!mfa, ip: ip });
-  res.writeHead(302, { 'Set-Cookie': [makeSession({ u: u.user, r: u.role || 'operator', name: u.name || u.user, m: method, mfa: !!mfa }), clearCookie('as_pend')], Location: '/' }); res.end();
+  res.writeHead(302, { 'Set-Cookie': [makeSession({ u: u.user, r: u.role || 'operator', name: u.name || u.user, m: method, mfa: !!mfa }, { ip: ip }), clearCookie('as_pend')], Location: '/' }); res.end();
 }
 function newCodes(u) { const codes = []; u.recovery = []; for (let i = 0; i < 8; i++) { const c = crypto.randomBytes(4).toString('hex').replace(/^(.{4})/, '$1-'); codes.push(c); u.recovery.push(crypto.createHash('sha256').update(c).digest('hex')); } return codes; }
 /* every successful password / AD bind lands here. Enrolled → TOTP code. Not enrolled and MFA required → enrolment screen,
@@ -385,8 +479,13 @@ function sameOrigin(req) { const o = req.headers.origin || req.headers.referer |
 const server = http.createServer(function (req, res) {
   const url = req.url.split('?')[0], qs = new URLSearchParams(req.url.split('?')[1] || ''), sess = session(req), ip = ipOf(req);
 
-  if (url === '/auth/verify') { if (sess) { res.writeHead(200, { 'X-Auth-Role': sess.r || 'viewer', 'X-Auth-User': sess.u || '' }); return res.end('ok'); } res.writeHead(401); return res.end('no'); }
-  if (url === '/logout' || url === '/auth/logout') { if (sess) audit({ event: 'sign-out', user: sess.u, ip: ip }); res.writeHead(302, { 'Set-Cookie': clearCookie('as_session'), Location: '/login' }); return res.end(); }
+  if (url === '/auth/verify') {
+    const ok = function (s) { res.writeHead(200, { 'X-Auth-Role': s.r || 'viewer', 'X-Auth-User': s.u || '' }); res.end('ok'); }, no = function () { res.writeHead(401); res.end('no'); };
+    if (!sess) return no();
+    if (sess.m === 'sso' && (ssoDue(sess.sid) || RECHECK[sess.sid])) return ssoRecheck(sess.sid).then(function (alive) { const r = SIDS[sess.sid]; if (!alive || !r) return no(); sess.r = r.r || sess.r; ok(sess); });   /* a due check answers before the request goes through */
+    return ok(sess);
+  }
+  if (url === '/logout' || url === '/auth/logout') { if (sess) { audit({ event: 'sign-out', user: sess.u, ip: ip }); endSession(sess.sid, 'signed out'); } res.writeHead(302, { 'Set-Cookie': clearCookie('as_session'), Location: '/login' }); return res.end(); }
   if (url === '/auth/whoami') { if (!sess) return json(res, 401, { error: 'not signed in' }); const u = userOf(sess.u); const ms = u ? mfaStatus(u) : null; return json(res, 200, { user: sess.u, role: sess.r, name: sess.name, method: sess.m || 'password', mfa: !!sess.mfa, mfaPending: !!sess.mfaPending, mfaEnrolled: !!(u && u.totp), mfaState: ms ? ms.state : (sess.m === 'sso' ? 'sso' : 'enrolled'), mfaDeadline: ms ? ms.deadline : null, local: !!u, source: u ? (u.source || 'local') : (sess.m === 'sso' ? 'sso' : 'local'), org: 'Arabian Shield Cooperative Insurance' }); }
 
   /* ── standalone sign-in ── */
@@ -469,7 +568,7 @@ const server = http.createServer(function (req, res) {
     if (!ssoOn()) return page(res, 400, loginPage('Single sign-on is not configured.'));
     return discovery().then(function (d) {
       const state = b64u(crypto.randomBytes(18)), nonce = b64u(crypto.randomBytes(18)), verifier = b64u(crypto.randomBytes(32)), challenge = b64u(crypto.createHash('sha256').update(verifier).digest());
-      const q = new URLSearchParams({ client_id: CFG.sso.clientId, response_type: 'code', redirect_uri: CFG.sso.redirectUri, scope: CFG.sso.scopes || 'openid profile email', state: state, nonce: nonce, code_challenge: challenge, code_challenge_method: 'S256', response_mode: 'query' });
+      const q = new URLSearchParams({ client_id: CFG.sso.clientId, response_type: 'code', redirect_uri: CFG.sso.redirectUri, scope: ssoScopes(), state: state, nonce: nonce, code_challenge: challenge, code_challenge_method: 'S256', response_mode: 'query' });
       if (CFG.sso.requireMfa && /microsoft|entra|azure/i.test(CFG.sso.provider || '')) q.set('claims', JSON.stringify({ id_token: { amr: { essential: true } } }));
       res.writeHead(302, { 'Set-Cookie': setCookie('as_sso', signed({ st: state, n: nonce, v: verifier }, 10), 600), Location: d.authorization_endpoint + '?' + q.toString() }); res.end();
     }).catch(function (e) { audit({ event: 'sso-error', ip: ip, reason: e.message }); page(res, 502, loginPage('Could not reach the identity provider: ' + e.message)); });
@@ -478,11 +577,12 @@ const server = http.createServer(function (req, res) {
     const st = unsign(cookie(req.headers.cookie, 'as_sso'));
     if (qs.get('error')) { const why = String(qs.get('error_description') || qs.get('error')).slice(0, 160); audit({ event: 'sso-denied', ip: ip, reason: why }); return page(res, 401, loginPage('Single sign-on was not completed: ' + why), clearCookie('as_sso')); }
     if (!st || !qs.get('code') || qs.get('state') !== st.st) { audit({ event: 'sso-denied', ip: ip, reason: 'state mismatch or expired' }); return page(res, 401, loginPage('Single sign-on expired — try again.'), clearCookie('as_sso')); }
+    let tok = null;
     return discovery().then(function (d) {
       const body = new URLSearchParams({ grant_type: 'authorization_code', code: qs.get('code'), redirect_uri: CFG.sso.redirectUri, client_id: CFG.sso.clientId, code_verifier: st.v });
       const secret = CFG.sso.clientSecret ? dec(CFG.sso.clientSecret) : null; if (secret) body.set('client_secret', secret);
       return httpsJSON(d.token_endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }, body.toString());
-    }).then(function (t) { return verifyIdToken(t.id_token, st.n); }).then(function (c) {
+    }).then(function (t) { tok = t; return verifyIdToken(t.id_token, st.n); }).then(function (c) {
       const email = String(c.preferred_username || c.email || c.upn || c.sub || '').toLowerCase();
       const dom = String(CFG.sso.allowedDomains || '').split(/[,\s]+/).filter(Boolean);
       if (dom.length && !dom.some(function (x) { return email.slice(-x.length - 1) === '@' + x.toLowerCase(); })) { audit({ event: 'sso-denied', user: email, ip: ip, reason: 'domain not allowed' }); return page(res, 403, loginPage('Your organisation is not allowed to sign in here.'), clearCookie('as_sso')); }
@@ -490,7 +590,7 @@ const server = http.createServer(function (req, res) {
       const role = mapRole(c);
       if (!role) { audit({ event: 'sso-denied', user: email, ip: ip, reason: 'no role assigned' }); return page(res, 403, loginPage('Your account has not been given access to this platform. Ask an administrator to assign you a role.'), clearCookie('as_sso')); }
       audit({ event: 'sign-in', user: email, role: role, method: 'sso', mfa: hasMfa(c), ip: ip });
-      res.writeHead(302, { 'Set-Cookie': [makeSession({ u: email, r: role, name: c.name || email, m: 'sso', mfa: hasMfa(c) }), clearCookie('as_sso')], Location: '/' }); res.end();
+      res.writeHead(302, { 'Set-Cookie': [makeSession({ u: email, r: role, name: c.name || email, m: 'sso', mfa: hasMfa(c) }, { sub: c.sub, rt: tok.refresh_token, ip: ip }), clearCookie('as_sso')], Location: '/' }); res.end();
     }).catch(function (e) { audit({ event: 'sso-error', ip: ip, reason: e.message }); page(res, 401, loginPage('Single sign-on failed: ' + e.message), clearCookie('as_sso')); });
   }
 
@@ -535,7 +635,14 @@ const server = http.createServer(function (req, res) {
         mfaPolicy: CFG.mfaPolicy, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, localLogin: CFG.localLogin, hours: HOURS,
         users: (CFG.users || []).map(function (u) { const ms = mfaStatus(u); return { user: u.user, name: u.name, role: u.role, mfa: !!u.totp, mfaSetting: u.mfa || 'policy', mfaRequired: mfaRequired(u), mfaState: ms.state, mfaGraceStart: u.mfaGraceStart || null, mfaDeadline: ms.deadline, disabled: !!u.disabled, created: u.created || null, createdBy: u.createdBy || null, mfaSince: u.mfaSince || null, recoveryLeft: (u.recovery || []).length, breakglass: !!u.breakglass, lastLogin: u.lastLogin || null, lastMethod: u.lastMethod || null, locked: locked(u.user), source: u.source || 'local', dn: u.dn || undefined, adBlocked: u.adBlocked || undefined }; }),
         ldap: (function () { const l = ldapCfg(); return { enabled: !!l.enabled, active: ldapOn(), servers: l.servers, caFile: l.caFile, baseDN: l.baseDN, bindDN: l.bindDN, hasBindPassword: !!l.bindPassword, netbios: l.netbios, upnSuffix: l.upnSuffix, userAttr: l.userAttr, groupRoles: l.groupRoles || {}, nested: l.nested !== false, requireMfa: l.requireMfa !== false }; })(),
+        session: sessCfg(), sessionsActive: Object.keys(SIDS).length,
         events: recentEvents(150), me: sess.u });
+    }
+    if (req.method === 'GET' && url === '/auth/admin/sessions') {   /* who is signed in now - never the tokens */
+      const t = Date.now();
+      return json(res, 200, { settings: sessCfg(), sessions: Object.keys(SIDS).filter(function (k) { return SIDS[k] && SIDS[k].exp > t; }).map(function (k) { const r = SIDS[k];
+        return { id: k.slice(0, 8), user: r.u, method: r.m, role: r.r, ip: r.ip || '', since: new Date(r.iat).toISOString(), lastSeen: new Date(r.last || r.iat).toISOString(), expires: new Date(r.exp).toISOString(),
+          sso: r.m === 'sso' ? { refresh: !!r.rt, nextCheck: r.chk ? new Date(r.chk).toISOString() : null, failingSince: r.fail ? new Date(r.fail).toISOString() : null } : undefined, current: k === sess.sid }; }) });
     }
     if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
     if (!sameOrigin(req)) return json(res, 403, { error: 'cross-origin request refused' });
@@ -579,6 +686,15 @@ const server = http.createServer(function (req, res) {
         return discovery(true).then(function (d) { return jwks(true).then(function (k) { json(res, 200, { ok: true, issuer: d.issuer, authorization: d.authorization_endpoint, token: d.token_endpoint, keys: (k.keys || []).length, amrSupported: (d.claims_supported || []).indexOf('amr') >= 0 }); }); })
           .catch(function (e) { json(res, 502, { error: e.message }); });
       }
+      if (url === '/auth/admin/sessions/revoke') {          /* {user} ends every session of that account, {id} one session (first 8 characters from the list) */
+        const who = String(b.user || '').toLowerCase().trim(), id = String(b.id || '');
+        if (!who && !/^[A-Za-z0-9_-]{8}$/.test(id)) return json(res, 400, { error: 'give user, or id (the 8-character session id from the list)' });
+        let n = 0;
+        if (who) n = endUserSessions(who, 'revoked by an administrator', sess.u);
+        else Object.keys(SIDS).forEach(function (k) { if (k.slice(0, 8) === id && endSession(k, 'revoked by an administrator', sess.u)) n++; });
+        audit({ event: 'session-revoke', user: who || id, ip: ip, reason: n + ' session(s) ended · by ' + sess.u });
+        return json(res, n ? 200 : 404, n ? { ok: true, ended: n } : { error: 'no active session matched' });
+      }
       if (url === '/auth/admin/policy') {
         if (b.mfaRequired != null) {
           const want = !!b.mfaRequired;
@@ -587,6 +703,13 @@ const server = http.createServer(function (req, res) {
           CFG.mfaRequired = want;
         }
         if (b.mfaGraceDays != null) { const n = Number(b.mfaGraceDays); if (!isFinite(n) || n < 0 || n > 3650) return json(res, 400, { error: 'mfaGraceDays must be a whole number of days between 0 and 3650' }); CFG.mfaGraceDays = Math.floor(n); }
+        if (b.session != null) {
+          if (typeof b.session !== 'object' || Array.isArray(b.session)) return json(res, 400, { error: 'session must be an object' });
+          const cur = Object.assign({}, CFG.session || {});
+          const ks = Object.keys(b.session); for (let i = 0; i < ks.length; i++) { const k = ks[i], l = SESSION_LIMITS[k]; if (!l) return json(res, 400, { error: 'unknown session setting ' + String(k).slice(0, 40) });
+            const n = Number(b.session[k]); if (!isFinite(n) || Math.floor(n) !== n || n < l[0] || n > l[1]) return json(res, 400, { error: 'session.' + k + ' must be a whole number between ' + l[0] + ' and ' + l[1] }); cur[k] = n; }
+          CFG.session = cur;
+        }
         if (b.mfaPolicy != null) { if (['all', 'admins', 'optional'].indexOf(b.mfaPolicy) < 0) return json(res, 400, { error: 'MFA policy is all, admins or optional' }); CFG.mfaPolicy = b.mfaPolicy; }
         if (b.localLogin != null) {
           if (['all', 'breakglass'].indexOf(b.localLogin) < 0) return json(res, 400, { error: 'local sign-in is all or breakglass' });
@@ -596,7 +719,7 @@ const server = http.createServer(function (req, res) {
           }
           CFG.localLogin = b.localLogin;
         }
-        save(); audit({ event: 'config', user: sess.u, ip: ip, reason: 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin });
+        save(); const sc = sessCfg(); audit({ event: 'config', user: sess.u, ip: ip, reason: 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin + ', idle ' + sc.idleMinutes + ' min, admin ' + sc.adminHours + ' h, SSO re-check ' + sc.ssoRecheckMinutes + ' min' }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin, session: sessCfg() });
       }
       if (url === '/auth/admin/users') {                      /* create a local account */
         const name = String(b.user || '').toLowerCase().trim();
@@ -617,7 +740,7 @@ const server = http.createServer(function (req, res) {
         if (um[2] === 'delete') {
           if (u.user === sess.u) return json(res, 400, { error: 'you cannot delete your own account' });
           if (u.role === 'admin' && !u.disabled && enabledAdmins(u.user) < 1) return json(res, 400, { error: 'keep at least one enabled administrator' });
-          CFG.users = CFG.users.filter(function (x) { return x.user !== u.user; }); delete FAIL[u.user]; save();
+          CFG.users = CFG.users.filter(function (x) { return x.user !== u.user; }); delete FAIL[u.user]; save(); endUserSessions(u.user, 'account deleted', sess.u);
           audit({ event: 'user-deleted', user: u.user, ip: ip, reason: 'by ' + sess.u }); return json(res, 200, { ok: true });
         }
         const changes = [];
@@ -642,7 +765,8 @@ const server = http.createServer(function (req, res) {
           changes.push('MFA ' + b.mfa);
         }
         if (!changes.length) return json(res, 400, { error: 'nothing to change' });
-        save(); audit({ event: 'user-updated', user: u.user, ip: ip, reason: changes.join(', ') + ' · by ' + sess.u }); return json(res, 200, { ok: true });
+        save(); if (u.disabled || b.password) endUserSessions(u.user, u.disabled ? 'account disabled' : 'password reset', sess.u);
+        audit({ event: 'user-updated', user: u.user, ip: ip, reason: changes.join(', ') + ' · by ' + sess.u }); return json(res, 200, { ok: true });
       }
       const m = /^\/auth\/admin\/users\/([a-z0-9._@-]+)\/(reset-mfa|unlock|breakglass)$/.exec(url);
       if (m) {
@@ -658,6 +782,6 @@ const server = http.createServer(function (req, res) {
   res.writeHead(404); res.end('not found');
 });
 if (require.main === module) server.listen(PORT, '127.0.0.1', function () { console.log('[as-auth] Arabian Shield sign-in gate on 127.0.0.1:' + PORT + ' · SSO ' + (ssoOn() ? 'on (' + CFG.sso.provider + ')' : 'off') + ' · MFA ' + (mfaMandatory() ? 'mandatory (grace ' + graceDays() + 'd)' : 'policy ' + CFG.mfaPolicy) + ' · AD ' + (ldapOn() ? 'on (' + domainLabel() + ')' : 'off')); });
-module.exports = { server: server, _t: { hotp: hotp, b32enc: b32enc, b32dec: b32dec, totpCheck: totpCheck, jwkToPem: jwkToPem, verifyIdToken: verifyIdToken, enc: enc, dec: dec, mapRole: mapRole, hasMfa: hasMfa,
+module.exports = { server: server, _t: { hotp: hotp, b32enc: b32enc, b32dec: b32dec, totpCheck: totpCheck, jwkToPem: jwkToPem, verifyIdToken: verifyIdToken, sessions: function () { return SIDS; }, SESS_FILE: SESS_FILE, enc: enc, dec: dec, mapRole: mapRole, hasMfa: hasMfa,
   ldapCfg: ldapCfg, ldapOn: ldapOn, adIdentity: adIdentity, adAuthenticate: adAuthenticate, shadowKey: shadowKey, CFG_FILE: CFG_FILE,
   mfaMandatory: mfaMandatory, mfaRequired: mfaRequired, mfaStatus: mfaStatus, graceDays: graceDays } };

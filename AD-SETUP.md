@@ -233,3 +233,26 @@ happened. Collect them with the Windows agent, source id **`win-dc`** — see `a
 4. On the SIEM, switch on the AD identity sync (`ash-siem/install/AD-IDENTITY.md`): it adds department, title, privileged /
    disabled / dormant flags to every event of a domain account and enables rules ASH-AD-001…005. It can use the same
    read-only service account.
+
+## Sessions and single sign-on re-check
+
+Every session is also kept on the server (`/etc/arabianshield-auth.sessions.json`, chmod 600, override with `AS_AUTH_SESS`),
+so it can end before its cookie does:
+
+| Event | Effect |
+|---|---|
+| Sign-out | the session ends on the server; a copied cookie no longer works |
+| Admin revoke | `GET /auth/admin/sessions` lists who is signed in (no tokens); `POST /auth/admin/sessions/revoke {"user": "..."}` or `{"id": "<8 chars>"}` ends them |
+| Account disabled, deleted or password reset | that account's sessions end at once |
+| Idle | no request for `idleMinutes` (default 60) ends the session |
+| Admin | admin sessions last `adminHours` (default 8) instead of `hours` (12) |
+| Single sign-on | every `ssoRecheckMinutes` (default 15) the gate asks the identity provider again (refresh-token grant). Disabled, deleted or revoked account, or role removed → the session ends at that check. Provider unreachable → tolerated for `ssoOutageMinutes` (60), then the session ends |
+| 2FA grace | a session admitted during the enrolment grace window is read-only (viewer) until TOTP is set up |
+
+The gate adds `offline_access` to the SSO scopes so the provider issues a refresh token (in Entra ID it is a default delegated
+permission). If the provider issues none, an SSO session lasts `ssoNoRefreshMinutes` (60) and the user signs in again. Refresh
+tokens are stored encrypted and never logged.
+
+Settings: `POST /auth/admin/policy {"session": {"idleMinutes": 30, "adminHours": 8, "ssoRecheckMinutes": 15, "ssoOutageMinutes": 60, "ssoNoRefreshMinutes": 60}}`
+(admin; each value is bounded and the change is audited). After the first install, sessions issued before it are not in the
+table: everyone signs in once more.

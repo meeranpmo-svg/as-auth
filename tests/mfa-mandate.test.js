@@ -136,6 +136,9 @@ test('local grace user: grace-admit issues a session but flags it mfaPending; au
   const who = await whoami(r2.cookies);
   assert.equal(who.mfa, false); assert.equal(who.mfaPending, true); assert.equal(who.mfaEnrolled, false); assert.equal(who.mfaState, 'grace');
   assert.match(log(), /"event":"grace-admit","user":"graceuser"/);
+  // without two-step verification the session is read-only: the operator account is passed to the platform as viewer
+  const v = await req('GET', '/auth/verify', { cookies: r2.cookies });
+  assert.equal(v.status, 200); assert.equal(v.headers['x-auth-role'], 'viewer', 'a grace session never carries the full role');
 });
 
 test('local user past the grace window: no grace control, grace admit refused, only enrolment completes sign-in', async () => {

@@ -9,6 +9,8 @@
 # <dest>/backup-ad-<timestamp>/; if the restart or the health check fails the backup is restored and the service restarted.
 # The config is NOT changed: AD sign-in stays off until an admin runs as-auth-ldap.js --init / --set-bind-password /
 # --check / --enable (AD-SETUP.md). Until then the gate behaves exactly as before.
+# The same files also carry the session hardening (server-side sessions, SSO re-check, idle timeout, shorter admin sessions):
+# sessions issued before it have no server-side record, so after the first install everyone signs in once more.
 set -euo pipefail
 umask 022
 
