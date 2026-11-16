@@ -201,6 +201,16 @@ The block written by `--init` (all names are configurable):
 
 ---
 
+### Only people an administrator added (recommended)
+
+`"access": "listed"` in the `ldap` block (or Identity & Sign-in → Users → *Who may sign in with their AD account* →
+**Only people added here**): AD still checks the password and refuses disabled / expired / locked accounts, but a person can
+sign in only after an administrator adds them there (**Add AD user**: `ASIC-HQ\jdoe`, `jdoe@asic-hq.com` or `jdoe`, plus a
+role). Nothing is created by a first sign-in, the role is the one set on that page (the SOC groups are not needed), and
+**Remove access** ends that person's sessions at once. Switching to it ends the sessions of every AD account on the list that
+was not added; **✓ Allow** next to an account lets it back in. Refused attempts are logged as
+`not added in the user manager`. `setup-ad-signin.sh` asks for this choice; the default without it is `"groups"`.
+
 ## 5. Troubleshooting
 
 | symptom (`--check`, `--test-user`, audit log) | cause / fix |

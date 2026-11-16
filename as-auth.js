@@ -103,7 +103,7 @@ function session(req) {
   }
   const u = (CFG.users || []).filter(function (x) { return x.user === s.u; })[0];
   if (!u || u.disabled) return null;
-  if (u.source === 'ad' && (u.adBlocked || !ldapOn())) return null;   /* AD said no / directory sign-in switched off → sessions end */
+  if (u.source === 'ad' && (u.adBlocked || !ldapOn() || (adListed() && !u.listed))) return null;   /* AD said no / directory sign-in switched off → sessions end */
   if (u.pwChanged && s.iat && s.iat < Date.parse(u.pwChanged)) return null;
   s.r = u.role || s.r; s.name = u.name || s.name;
   if (s.mfaPending) s.r = 'viewer';   /* enrolment grace: read-only until two-step verification is set up */
@@ -234,13 +234,21 @@ function failed(u, ip) { const f = FAIL[u] || (FAIL[u] = { n: 0 }); f.n++; if (f
 function ipBlocked(ip) { const g = (IPFAIL[ip] || []).filter(function (t) { return Date.now() - t < 10 * 60e3; }); IPFAIL[ip] = g; return g.length >= 25; }
 
 /* ─────────── on-premises Active Directory (LDAPS) ─────────── */
-const LDAP_DEFAULTS = { enabled: false, servers: [], caFile: '', baseDN: '', bindDN: '', bindPassword: '', netbios: [], upnSuffix: [], userAttr: 'sAMAccountName', groupRoles: {}, nested: true, requireMfa: true, timeoutMs: 8000, hint: '' };
+const LDAP_DEFAULTS = { enabled: false, servers: [], caFile: '', baseDN: '', bindDN: '', bindPassword: '', netbios: [], upnSuffix: [], userAttr: 'sAMAccountName', groupRoles: {}, nested: true, requireMfa: true, timeoutMs: 8000, hint: '', access: 'groups' };
 const AD_USER_ATTRS = ['sAMAccountName', 'userPrincipalName', 'displayName', 'mail', 'userAccountControl', 'msDS-User-Account-Control-Computed', 'accountExpires', 'lockoutTime', 'memberOf'];
 const RANK = { admin: 3, operator: 2, viewer: 1 };
 let LDAPLIB = null, LOCKDUR = { at: 0, ms: null };
 function ldapLib() { if (!LDAPLIB) LDAPLIB = require('./ldap-client.js'); return LDAPLIB; }
 function strList(v) { return [].concat(v == null ? [] : v).map(function (x) { return String(x).trim(); }).filter(Boolean); }
 function ldapCfg() { syncLdapFromDisk(); const l = Object.assign({}, LDAP_DEFAULTS, CFG.ldap || {}); l.servers = [].concat(l.servers || []); l.netbios = strList(l.netbios); l.upnSuffix = strList(l.upnSuffix).map(function (x) { return x.toLowerCase(); }); return l; }
+/* access 'listed': AD checks the password, but only people an administrator added in the user manager (Identity & Sign-in →
+   Users, "Add AD user") may sign in, with the role set there - nobody is created by a first sign-in. 'groups' (default): anyone
+   in a mapped AD group, role from the group, the record created at first sign-in. */
+function adListed() { return ldapCfg().access === 'listed'; }
+function adRecord(info) {   /* the AD record for this person: by sAMAccountName key, else by the UPN an admin entered */
+  const k = shadowKey(info.sam), upn = String(info.upn || '').toLowerCase();
+  return userOf(k) || (upn ? (CFG.users || []).find(function (u) { return u.source === 'ad' && (u.user === upn || u.upn === upn); }) : null) || null;
+}
 function ldapOn() { const l = ldapCfg(); return !!(l.enabled && l.servers.length && l.baseDN && l.bindDN); }
 function domainLabel() { const l = ldapCfg(); return l.netbios[0] || l.upnSuffix[0] || 'directory'; }
 function ldapLog(level, msg, meta) { if (level === 'warn' || level === 'error') console.log('[as-auth] ' + msg + ' ' + JSON.stringify(meta || {})); }   /* meta: server + error text only */
@@ -311,15 +319,21 @@ async function adAuthenticate(id, password) {
       return { ok: false, reason: 'AD rejected the password' + (c ? ' (data ' + c + ')' : ' (result ' + err.code + ')'), info: info };
     }
     info.bind = 'ok';
-    if (!info.role) return { ok: false, unauthorised: true, reason: 'not in any mapped AD group', info: info };
+    if (!info.role && !adListed()) return { ok: false, unauthorised: true, reason: 'not in any mapped AD group', info: info };
     return { ok: true, info: info };
   });
 }
 /* local shadow record of an AD account: no password, role from AD groups, TOTP + throttling + audit reuse the local code */
 function upsertShadow(info) {
-  const key = shadowKey(info.sam); let u = userOf(key);
+  const key = shadowKey(info.sam); let u = adListed() ? adRecord(info) : userOf(key);
   if (u && u.source !== 'ad') return null;                 /* never take over a local account */
   const now = new Date().toISOString();
+  if (adListed()) {                                        /* only an account an administrator added; its role is the one set there */
+    if (!u || !u.listed) return { notListed: true, key: u ? u.user : key };
+    u.dn = info.dn; u.name = u.name || String(info.name || info.sam).slice(0, 80); u.upn = info.upn || ''; u.mail = info.mail || ''; u.adSeen = now; u.sam = info.sam;
+    delete u.salt; delete u.passHash; delete u.breakglass; delete u.adBlocked;
+    return u;
+  }
   if (!u) { u = { user: key, source: 'ad', created: now, createdBy: 'active-directory' }; CFG.users = CFG.users || []; CFG.users.push(u); audit({ event: 'user-provisioned', user: key, role: info.role, method: 'ad', reason: 'first AD sign-in · ' + info.dn }); }
   else if (u.role && u.role !== info.role) audit({ event: 'role-changed', user: key, role: info.role, method: 'ad', reason: u.role + ' → ' + info.role + ' (AD group membership)' });
   u.dn = info.dn; u.role = info.role; u.name = String(info.name || info.sam).slice(0, 80); u.upn = info.upn || ''; u.mail = info.mail || ''; u.adSeen = now;
@@ -345,6 +359,7 @@ function adLogin(res, name, pw, ip) {
     }
     const u = upsertShadow(r.info);
     if (!u) { audit({ event: 'denied', user: k, ip: ip, method: 'ad', reason: 'a local account already uses this name' }); return generic(); }
+    if (u.notListed) { audit({ event: 'denied', user: u.key, ip: ip, method: 'ad', reason: 'not added in the user manager (AD access: listed users only)' }); return page(res, 403, loginPage('Your account has not been given access to this platform. Ask an administrator to add you in Identity & Sign-in → Users.')); }
     if (u.disabled) { saveLogged(); audit({ event: 'denied', user: u.user, ip: ip, method: 'ad', reason: 'account disabled on this platform' }); return page(res, 403, loginPage('This account is disabled. Contact an administrator.')); }
     delete FAIL[key]; delete FAIL[u.user]; save();
     return beginMfa(res, u, ip);
@@ -657,8 +672,8 @@ const server = http.createServer(function (req, res) {
       const s = CFG.sso;
       return json(res, 200, { sso: { enabled: !!s.enabled, provider: s.provider, issuer: s.issuer, clientId: s.clientId, hasSecret: !!s.clientSecret, redirectUri: s.redirectUri || ('https://' + req.headers.host + '/auth/sso/callback'), scopes: s.scopes, roleClaim: s.roleClaim, roleMap: s.roleMap || {}, defaultRole: s.defaultRole, requireMfa: s.requireMfa !== false, allowedDomains: s.allowedDomains || '' },
         mfaPolicy: CFG.mfaPolicy, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, localLogin: CFG.localLogin, hours: HOURS,
-        users: (CFG.users || []).map(function (u) { const ms = mfaStatus(u); return { user: u.user, name: u.name, role: u.role, mfa: !!u.totp, mfaSetting: u.mfa || 'policy', mfaRequired: mfaRequired(u), mfaState: ms.state, mfaGraceStart: u.mfaGraceStart || null, mfaDeadline: ms.deadline, disabled: !!u.disabled, created: u.created || null, createdBy: u.createdBy || null, mfaSince: u.mfaSince || null, recoveryLeft: (u.recovery || []).length, breakglass: !!u.breakglass, lastLogin: u.lastLogin || null, lastMethod: u.lastMethod || null, locked: locked(u.user), source: u.source || 'local', dn: u.dn || undefined, adBlocked: u.adBlocked || undefined }; }),
-        ldap: (function () { const l = ldapCfg(); return { enabled: !!l.enabled, active: ldapOn(), servers: l.servers, caFile: l.caFile, baseDN: l.baseDN, bindDN: l.bindDN, hasBindPassword: !!l.bindPassword, netbios: l.netbios, upnSuffix: l.upnSuffix, userAttr: l.userAttr, groupRoles: l.groupRoles || {}, nested: l.nested !== false, requireMfa: l.requireMfa !== false }; })(),
+        users: (CFG.users || []).map(function (u) { const ms = mfaStatus(u); return { user: u.user, name: u.name, role: u.role, mfa: !!u.totp, mfaSetting: u.mfa || 'policy', mfaRequired: mfaRequired(u), mfaState: ms.state, mfaGraceStart: u.mfaGraceStart || null, mfaDeadline: ms.deadline, disabled: !!u.disabled, created: u.created || null, createdBy: u.createdBy || null, mfaSince: u.mfaSince || null, recoveryLeft: (u.recovery || []).length, breakglass: !!u.breakglass, lastLogin: u.lastLogin || null, lastMethod: u.lastMethod || null, locked: locked(u.user), source: u.source || 'local', dn: u.dn || undefined, adBlocked: u.adBlocked || undefined, listed: u.source === 'ad' ? !!u.listed : undefined, listedBy: u.listedBy || undefined }; }),
+        ldap: (function () { const l = ldapCfg(); return { enabled: !!l.enabled, active: ldapOn(), servers: l.servers, caFile: l.caFile, baseDN: l.baseDN, bindDN: l.bindDN, hasBindPassword: !!l.bindPassword, netbios: l.netbios, upnSuffix: l.upnSuffix, userAttr: l.userAttr, groupRoles: l.groupRoles || {}, nested: l.nested !== false, requireMfa: l.requireMfa !== false, access: l.access }; })(),
         session: sessCfg(), sessionsActive: Object.keys(SIDS).length,
         mfaChanges: mfaChanges().map(function (c) { return { id: c.id, kind: c.kind, changes: c.changes, target: c.target, by: c.by, at: c.at, expires: c.expires, summary: describeChange(c), canApprove: c.by !== sess.u && !!sess.mfa }; }),
         events: recentEvents(150), me: sess.u });
@@ -777,8 +792,35 @@ const server = http.createServer(function (req, res) {
           }
           CFG.localLogin = b.localLogin;
         }
-        save(); const sc = sessCfg(); audit({ event: 'config', user: sess.u, ip: ip, reason: 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin + ', idle ' + sc.idleMinutes + ' min, admin ' + sc.adminHours + ' h, SSO re-check ' + sc.ssoRecheckMinutes + ' min' }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin, session: sessCfg(),
+        let adNote = '';
+        if (b.adAccess != null) {
+          if (['groups', 'listed'].indexOf(b.adAccess) < 0) return json(res, 400, { error: 'adAccess is groups or listed' });
+          if (!CFG.ldap) return json(res, 400, { error: 'AD sign-in is not set up on this server (as-auth-ldap.js --init)' });
+          const before = ldapCfg().access; CFG.ldap.access = b.adAccess;
+          if (before !== b.adAccess) {
+            const ad = (CFG.users || []).filter(function (u) { return u.source === 'ad'; }), keep = ad.filter(function (u) { return u.listed; }).length;
+            adNote = ', AD access ' + b.adAccess + (b.adAccess === 'listed' ? ' (' + keep + ' AD account(s) added keep access, ' + (ad.length - keep) + ' lose it)' : '');
+            if (b.adAccess === 'listed') ad.filter(function (u) { return !u.listed; }).forEach(function (u) { endUserSessions(u.user, 'AD access limited to users added in the user manager', sess.u); });
+          }
+        }
+        save(); const sc = sessCfg(); audit({ event: 'config', user: sess.u, ip: ip, reason: adNote.slice(2) + (adNote ? ' · ' : '') + 'policy: MFA ' + (mfaMandatory() ? 'mandatory' : 'legacy/' + CFG.mfaPolicy) + ', grace ' + graceDays() + 'd, local sign-in ' + CFG.localLogin + ', idle ' + sc.idleMinutes + ' min, admin ' + sc.adminHours + ' h, SSO re-check ' + sc.ssoRecheckMinutes + ' min' }); return json(res, 200, { ok: true, mfaRequired: mfaMandatory(), mfaGraceDays: graceDays(), mfaPolicyActivated: CFG.mfaPolicyActivated || null, mfaPolicy: CFG.mfaPolicy, localLogin: CFG.localLogin, session: sessCfg(), adAccess: CFG.ldap ? ldapCfg().access : null,
           pending: pending ? { id: pending.id, changes: pending.changes, expires: pending.expires, note: 'weakens two-step verification: takes effect when a different administrator approves it' } : undefined });
+      }
+      if (url === '/auth/admin/users' && b.ad === true) {     /* allow one AD account to sign in (no password here: AD checks it) */
+        if (ROLES.indexOf(b.role) < 0) return json(res, 400, { error: 'role must be admin, operator or viewer' });
+        const id = adIdentity(String(b.user || '').trim());
+        if (!id) return json(res, 400, { error: 'user: an AD name like ' + domainLabel() + '\\jdoe, jdoe@' + (ldapCfg().upnSuffix[0] || 'domain') + ' or jdoe' });
+        if (id.attr !== 'userPrincipalName' && !/^[A-Za-z0-9._-]{1,64}$/.test(id.value)) return json(res, 400, { error: 'user: the account name may contain letters, digits, dot, dash and underscore only' });
+        const key = provisionalKey(id);
+        let u = userOf(key);
+        if (u && u.source !== 'ad') return json(res, 409, { error: 'a local account already uses this name' });
+        if (u && u.listed) return json(res, 409, { error: 'that AD account is already added' });
+        const now = new Date().toISOString(), wasAuto = !!u;
+        if (!u) { u = { user: key, source: 'ad', created: now, createdBy: sess.u }; CFG.users = CFG.users || []; CFG.users.push(u); }
+        u.listed = true; u.listedBy = sess.u; u.listedAt = now; u.role = b.role; if (b.name) u.name = String(b.name).slice(0, 80); else if (!u.name) u.name = id.value.slice(0, 80);
+        delete u.adBlocked; save();
+        audit({ event: 'user-created', user: key, role: u.role, ip: ip, method: 'ad', reason: (wasAuto ? 'existing AD account allowed' : 'AD account added') + ' by ' + sess.u });
+        return json(res, 200, { ok: true, user: key });
       }
       if (url === '/auth/admin/users') {                      /* create a local account */
         const name = String(b.user || '').toLowerCase().trim();
@@ -805,7 +847,15 @@ const server = http.createServer(function (req, res) {
         }
         const changes = [];
         if (b.name != null) { u.name = String(b.name).slice(0, 80); changes.push('name'); }
-        if (u.source === 'ad' && (b.role != null || b.password)) return json(res, 400, { error: 'directory accounts take their role from AD groups and their password from AD' });
+        if (u.source === 'ad' && b.password) return json(res, 400, { error: 'directory accounts take their password from AD' });
+        if (u.source === 'ad' && b.role != null && !adListed()) return json(res, 400, { error: 'directory accounts take their role from AD groups (switch AD access to "only users added here" to set roles on this page)' });
+        if (b.listed != null) {
+          if (u.source !== 'ad') return json(res, 400, { error: 'listed applies to AD accounts only' });
+          if (!b.listed && u.user === sess.u) return json(res, 400, { error: 'you cannot remove your own access' });
+          if (!b.listed && u.role === 'admin' && !u.disabled && enabledAdmins(u.user) < 1) return json(res, 400, { error: 'keep at least one enabled administrator' });
+          if (b.listed) { u.listed = true; u.listedBy = sess.u; u.listedAt = new Date().toISOString(); } else delete u.listed;
+          changes.push(b.listed ? 'allowed to sign in with AD' : 'AD sign-in access removed');
+        }
         if (b.role != null) {
           if (ROLES.indexOf(b.role) < 0) return json(res, 400, { error: 'role must be admin, operator or viewer' });
           if (u.role === 'admin' && b.role !== 'admin' && (u.user === sess.u || enabledAdmins(u.user) < 1)) return json(res, 400, { error: u.user === sess.u ? 'you cannot remove your own administrator role' : 'keep at least one enabled administrator' });
@@ -827,6 +877,7 @@ const server = http.createServer(function (req, res) {
         if (mfaPending && !changes.length) return json(res, 202, { ok: true, pending: { id: mfaPending.id, note: 'MFA off for ' + u.user + ' takes effect when a different administrator approves it' } });
         if (!changes.length) return json(res, 400, { error: 'nothing to change' });
         save(); if (u.disabled || b.password) endUserSessions(u.user, u.disabled ? 'account disabled' : 'password reset', sess.u);
+        else if (u.source === 'ad' && b.listed === false && adListed()) endUserSessions(u.user, 'AD sign-in access removed', sess.u);
         audit({ event: 'user-updated', user: u.user, ip: ip, reason: changes.join(', ') + ' · by ' + sess.u }); return json(res, 200, mfaPending ? { ok: true, pending: { id: mfaPending.id } } : { ok: true });
       }
       const m = /^\/auth\/admin\/users\/([a-z0-9._@-]+)\/(reset-mfa|unlock|breakglass)$/.exec(url);

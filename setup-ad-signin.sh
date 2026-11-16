@@ -7,7 +7,8 @@
 #   1. installs as-auth.js / ldap-client.js / as-auth-ldap.js with install-ad.sh (backup + automatic rollback) when the
 #      installed copies differ from these;
 #   2. adds the (disabled) AD settings block once (--init);
-#   3. asks for the service account DN and the three role-group DNs (Enter keeps what is there), backs the config up;
+#   3. asks for the service account DN and the three role-group DNs (Enter keeps what is there), backs the config up,
+#      and who may sign in: only people an administrator adds in the user manager (recommended), or anyone in the groups;
 #   4. runs --set-bind-password, --check, --test-user and, only when you say so, --enable.
 # Passwords are never read by this script: as-auth-ldap.js asks for them itself, without echo, and stores the service
 # password encrypted. Safe to run again: every step shows the current state and can be skipped.
@@ -85,6 +86,21 @@ if ask "    change any of them?" n; then
     || die "could not save - the config is unchanged (backup $BAK)"
   echo "    saved:"; show
 fi
+
+# ---------------------------------------------------------------- 3b. who may sign in
+echo
+ACC="$("$NODE" -e 'const l=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ldap||{};console.log(l.access||"groups")' "$CFG")"
+echo "    Who may sign in with AD now: $( [ "$ACC" = listed ] && echo 'ONLY people an administrator added in Identity & Sign-in -> Users' || echo 'anyone in the three SOC groups (account created at first sign-in)')"
+if ask "    allow ONLY people an administrator adds in Identity & Sign-in -> Users (recommended)?" "$( [ "$ACC" = listed ] && echo y || echo y )"; then WANT=listed; else WANT=groups; fi
+if [ "$WANT" != "$ACC" ]; then
+  BAK="$CFG.bak-$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$BAK"; echo "    backup: $BAK"
+  ZW="$WANT" "$NODE" -e '
+    const fs=require("fs"), f=process.argv[1], c=JSON.parse(fs.readFileSync(f,"utf8")); c.ldap.access=process.env.ZW;
+    const st=fs.statSync(f), t=f+".tmp-"+process.pid;
+    fs.writeFileSync(t, JSON.stringify(c,null,2)+"\n", {mode:st.mode&0o777}); fs.chownSync(t, st.uid, st.gid); fs.renameSync(t,f);' "$CFG" || die "could not save (backup $BAK)"
+  echo "    saved: $WANT"
+fi
+[ "$WANT" = listed ] && echo "    -> after switching on, add each person in Identity & Sign-in -> Users -> Add AD user (name + role). A local admin signs in first to do that."
 
 # ---------------------------------------------------------------- 4. service password
 say "4/6  service account password"

@@ -272,3 +272,65 @@ test('as-auth-ldap.js --test-user: DN, flags, nested groups → role, verdict; p
   const d = await cli(['--test-user', 'erin'], PASSWORDS.user + '\n');
   assert.equal(d.code, 1); assert.match(d.out, /disabled=true/); assert.match(d.out, /REFUSED — account disabled in AD/);
 });
+
+// AD access "listed": AD checks the password, but only accounts an administrator added in the user manager may sign in,
+// with the role set there; nobody is created by a first sign-in; switching it on ends the sessions of everyone not added.
+test('AD access limited to users added in the user manager', async () => {
+  const jpost = (p, b, cookies) => new Promise((resolve, reject) => {
+    const body = JSON.stringify(b || {});
+    const q = http.request({ host: '127.0.0.1', port, method: 'POST', path: p, headers: { Cookie: Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; '), 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => { let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => resolve({ status: res.statusCode, json: (() => { try { return JSON.parse(d); } catch (e) { return {}; } })() })); });
+    q.on('error', reject); q.end(body);
+  });
+  const adm = (await req('POST', '/login', { form: { user: 'localadmin', pass: LOCAL_PW } })).cookies;
+  // carol (auto-created by her first sign-in in group mode) has a session now
+  const c1 = await req('POST', '/login', { form: { user: 'carol', pass: PASSWORDS.user } });
+  const c2 = await req('POST', '/login/otp', { form: { code: totp(SECRETS['carol@asic-hq.com'], Math.floor(Date.now() / 30000) + 1) }, cookies: c1.cookies }); const carol = c2.cookies;
+  assert.equal(c2.status, 302, c1.status + ' ' + errText(c1.body) + ' | ' + errText(c2.body));
+  assert.equal((await req('GET', '/auth/verify', { cookies: carol })).status, 200);
+  // validation
+  assert.equal((await jpost('/auth/admin/policy', { adAccess: 'everyone' }, adm)).status, 400);
+  assert.equal((await jpost('/auth/admin/users', { ad: true, user: 'ASIC-HQ\\gina' }, adm)).status, 400, 'role is required');
+  const foreign = await jpost('/auth/admin/users', { ad: true, user: 'OTHERDOM\\gina', role: 'viewer' }, adm);
+  assert.equal(foreign.status, 400); assert.match(foreign.json.error, /AD name like ASIC-HQ/);
+  assert.equal((await jpost('/auth/admin/users', { ad: true, user: 'gi(na)*', role: 'viewer' }, adm)).status, 400);
+  // switch on: carol (never added) loses access at once, her session ends
+  const on = await jpost('/auth/admin/policy', { adAccess: 'listed' }, adm);
+  assert.equal(on.status, 200); assert.equal(on.json.adAccess, 'listed'); assert.equal(cfg().ldap.access, 'listed');
+  assert.equal((await req('GET', '/auth/verify', { cookies: carol })).status, 401, 'a session of someone not added ends');
+  const refused = await req('POST', '/login', { form: { user: 'carol', pass: PASSWORDS.user } });
+  assert.equal(refused.status, 403); assert.match(errText(refused.body), /Ask an administrator to add you in Identity &amp; Sign-in|Ask an administrator to add you in Identity & Sign-in/);
+  // gina is in no SOC group: once added (role operator) she signs in, with that role
+  assert.equal((await req('POST', '/login', { form: { user: 'gina', pass: PASSWORDS.user } })).status, 403, 'not added yet');
+  const add = await jpost('/auth/admin/users', { ad: true, user: 'ASIC-HQ\\gina', role: 'operator', name: 'Gina Synthetic' }, adm);
+  assert.equal(add.status, 200, JSON.stringify(add.json)); assert.equal(add.json.user, 'gina@asic-hq.com');
+  assert.equal((await jpost('/auth/admin/users', { ad: true, user: 'gina@asic-hq.com', role: 'viewer' }, adm)).status, 409, 'added twice');
+  const g = await enrolLogin('gina', PASSWORDS.user);
+  const who = JSON.parse((await req('GET', '/auth/whoami', { cookies: g.cookies })).body);
+  assert.equal(who.user, 'gina@asic-hq.com'); assert.equal(who.role, 'operator'); assert.equal(who.source, 'ad');
+  assert.equal((await req('POST', '/login', { form: { user: 'gina', pass: 'wrong-' + PASSWORDS.user } })).status, 401, 'AD still checks the password');
+  // only an admin manages this
+  assert.equal((await jpost('/auth/admin/users', { ad: true, user: 'ASIC-HQ\\hank', role: 'admin' }, g.cookies)).status, 403);
+  assert.equal((await jpost('/auth/admin/policy', { adAccess: 'groups' }, g.cookies)).status, 403);
+  // the role is set on the user manager page; the password never
+  assert.equal((await jpost('/auth/admin/users/gina@asic-hq.com/update', { role: 'viewer' }, adm)).status, 200);
+  assert.equal(JSON.parse((await req('GET', '/auth/whoami', { cookies: g.cookies })).body).role, 'viewer', 'role change applies to the open session');
+  assert.equal((await jpost('/auth/admin/users/gina@asic-hq.com/update', { password: 'Another-Pass-123' }, adm)).status, 400);
+  // an existing (auto-created) AD account can be allowed too
+  assert.equal((await jpost('/auth/admin/users', { ad: true, user: 'carol', role: 'viewer' }, adm)).status, 200);
+  assert.equal(shadow('carol@asic-hq.com').listed, true);
+  // access removed: her session ends, the next sign-in is refused
+  assert.equal((await jpost('/auth/admin/users/gina@asic-hq.com/update', { listed: false }, adm)).status, 200);
+  assert.equal((await req('GET', '/auth/verify', { cookies: g.cookies })).status, 401);
+  assert.equal((await req('POST', '/login', { form: { user: 'gina', pass: PASSWORDS.user } })).status, 403);
+  // admin view and audit
+  const conf = JSON.parse((await req('GET', '/auth/admin/config', { cookies: adm })).body);
+  assert.equal(conf.ldap.access, 'listed'); assert.equal(conf.users.find((u) => u.user === 'carol@asic-hq.com').listed, true);
+  const log = fs.readFileSync(logFile, 'utf8');
+  assert.match(log, /"event":"user-created","user":"gina@asic-hq.com","role":"operator"[^\n]*AD account added by localadmin/);
+  assert.match(log, /AD access listed \(\d+ AD account\(s\) added keep access, \d+ lose it\)/);
+  assert.match(log, /"event":"denied","user":"carol@asic-hq.com"[^\n]*not added in the user manager/);
+  assert.ok(!log.includes(PASSWORDS.user), 'no password in the sign-in log');
+  // back to group mode
+  assert.equal((await jpost('/auth/admin/policy', { adAccess: 'groups' }, adm)).status, 200);
+});

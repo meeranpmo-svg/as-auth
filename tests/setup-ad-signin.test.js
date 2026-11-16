@@ -11,12 +11,12 @@ test('guided AD setup: DNs validated and saved, check failure leaves AD sign-in 
   for (const f of ['as-auth.js', 'ldap-client.js', 'as-auth-ldap.js']) fs.copyFileSync(path.join(ROOT, f), path.join(S, 'dest', f));
   fs.writeFileSync(S + '/cfg.json', '{"users":{},"secret":"synthetic"}\n', { mode: 0o600 });
   const B = 'CN=svc-syn,OU=Service Accounts,DC=asic-hq,DC=com', A = 'CN=SYN-Admins,OU=Groups,DC=asic-hq,DC=com';
-  const r = spawnSync('python3', [path.join(__dirname, 'setup-ad-signin-pty.py'), S, 'y', 'not a dn', B, A, '', '', 'n'], { encoding: 'utf8', timeout: 90000 });
+  const r = spawnSync('python3', [path.join(__dirname, 'setup-ad-signin-pty.py'), S, 'y', 'not a dn', B, A, '', '', 'y', 'n'], { encoding: 'utf8', timeout: 90000 });
   const outp = r.stdout || '';
   assert.match(outp, /not a DN like/, 'a malformed DN is refused'); assert.match(outp, /backup: /); assert.match(outp, /\[FAIL\]/);
   assert.match(outp, /AD sign-in is still off/); assert.match(outp, /EXIT 1/);
   const c = JSON.parse(fs.readFileSync(S + '/cfg.json', 'utf8'));
-  assert.equal(c.ldap.enabled, false); assert.equal(c.ldap.bindDN, B); assert.equal(c.ldap.groupRoles[A], 'admin');
+  assert.equal(c.ldap.enabled, false); assert.equal(c.ldap.access, 'listed', 'only people added in the user manager'); assert.equal(c.ldap.bindDN, B); assert.equal(c.ldap.groupRoles[A], 'admin');
   assert.equal(Object.values(c.ldap.groupRoles).filter((x) => x === 'operator').length, 1, 'Enter kept the operator group');
   assert.equal(fs.statSync(S + '/cfg.json').mode & 0o777, 0o600, 'mode kept'); assert.equal(c.secret, 'synthetic', 'other settings untouched');
   fs.rmSync(S, { recursive: true, force: true });
