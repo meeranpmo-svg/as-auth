@@ -42,14 +42,16 @@ function promptHidden(label) {
   return new Promise(function (resolve) {
     const stdin = process.stdin;
     let pw = '';
-    process.stderr.write(label);
+    process.stderr.write(label + '(typing shows * ; Enter when done) ');
     stdin.setRawMode(true); stdin.resume(); stdin.setEncoding('utf8');
     function cleanup() { stdin.setRawMode(false); stdin.pause(); stdin.removeListener('data', on); }
     function on(chunk) {
       for (const c of chunk) {
-        if (c === '\r' || c === '\n') { cleanup(); process.stderr.write('\n'); return resolve(pw); }
+        // a line break before anything was typed is left over from the previous answer (a Windows terminal over SSH sends
+        // CR LF): ignore it, or the prompt would end at once with an empty password
+        if (c === '\r' || c === '\n') { if (!pw) continue; cleanup(); process.stderr.write('\n'); return resolve(pw); }
         if (c === '\u0003') { cleanup(); process.stderr.write('\n'); process.exit(130); }
-        if (c === '\u007f' || c === '\b') pw = pw.slice(0, -1); else pw += c;
+        if (c === '\u007f' || c === '\b') { if (pw) { pw = pw.slice(0, -1); process.stderr.write('\b \b'); } } else { pw += c; process.stderr.write('*'); }
       }
     }
     stdin.on('data', on);

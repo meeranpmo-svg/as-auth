@@ -25,8 +25,10 @@ TOOL="$DEST/as-auth-ldap.js"
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
-ask() { local a; read -r -p "$1 [${2:-y}/$( [ "${2:-y}" = y ] && echo n || echo y )] " a || true; a="${a:-${2:-y}}"; [[ "$a" =~ ^[Yy] ]]; }
-tool() { "$NODE" "$TOOL" "$@"; }
+ask() { local a; flush; read -r -p "$1 [${2:-y}/$( [ "${2:-y}" = y ] && echo n || echo y )] " a || true; a="${a:-${2:-y}}"; [[ "$a" =~ ^[Yy] ]]; }
+# drop keystrokes left over from the previous answer (a Windows terminal over SSH sends CR LF) before a prompt reads
+flush() { local junk; while read -r -t 0.05 -n 256 junk 2>/dev/null; do :; done; }
+tool() { flush; "$NODE" "$TOOL" "$@"; }
 
 [ "$(id -u)" = 0 ] || die "run as root: sudo bash $0"
 [ -x "$NODE" ] || die "node not found (set NODE=/path/to/node)"
@@ -69,7 +71,7 @@ if ask "    change any of them?" n; then
     if (w==="bind") console.log(l.bindDN||""); else console.log(Object.keys(l.groupRoles||{}).find(k=>l.groupRoles[k]===w)||"");' "$CFG" "$1"; }
   okdn() { [[ "$1" =~ ^[Cc][Nn]=[^,]+(,[A-Za-z]+=[^,]+)*,[Dd][Cc]=[^,]+$ ]]; }
   readdn() { local c v; c="$(cur "$1")"
-    while :; do read -r -p "    $2 [Enter keeps: ${c:-none}]: " v || true; v="${v:-$c}"
+    while :; do flush; read -r -p "    $2 [Enter keeps: ${c:-none}]: " v || true; v="${v:-$c}"
       [ -n "$v" ] && okdn "$v" && { printf '%s' "$v"; return; }
       echo "      that is not a DN like CN=Name,OU=Groups,DC=asic-hq,DC=com - try again" >&2; done; }
   B="$(readdn bind 'service account DN')"; echo
@@ -115,7 +117,7 @@ if ! tool --check; then die "the check found a problem (the [FAIL] lines above).
 echo
 echo "    Now one real sign-in test with a person who is in one of the SOC groups."
 echo "    (A wrong password counts towards that person's AD lockout, like any failed logon.)"
-read -r -p "    user to test, e.g. ASIC-HQ\\jdoe (Enter to skip): " TU || true
+flush; read -r -p "    user to test, e.g. ASIC-HQ\\jdoe (Enter to skip): " TU || true
 if [ -n "${TU:-}" ]; then
   [[ "$TU" =~ ^[A-Za-z0-9._@\\-]{1,120}$ ]] || die "that does not look like a user name"
   tool --test-user "$TU" || die "the test sign-in failed (the reason is above). AD sign-in is still off."
