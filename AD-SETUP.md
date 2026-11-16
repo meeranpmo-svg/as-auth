@@ -125,6 +125,8 @@ AD sign-in stays **off** after the install — the gate behaves exactly as befor
 
 ## 3. Configure and switch on (exact commands, on the server as root)
 
+Guided alternative: from the PC run `powershell -ExecutionPolicy Bypass -File .\setup-ad-signin.ps1` - it copies the files and runs `setup-ad-signin.sh` on the server, which does sections 2 and 3 step by step, asking before each change.
+
 ```bash
 cd /opt/arabianshield-auth
 sudo /usr/bin/node as-auth-ldap.js --init                  # adds a DISABLED "ldap" block with the ASIC-HQ defaults
