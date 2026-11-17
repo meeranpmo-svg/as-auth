@@ -77,14 +77,27 @@ if ask "    change any of them?" "$( [ "$(svcname)" = svc-zyberon-ldap ] && echo
     while :; do flush; read -r -p "    $2 [Enter keeps: ${c:-none}]: " v || true; v="${v:-$c}"
       [ -n "$v" ] && okdn "$v" && { printf '%s' "$v"; return; }
       echo "      that is not a DN like CN=Name,OU=Groups,DC=asic-hq,DC=com - try again" >&2; done; }
+  # directory servers: ldaps://dc:636 (TLS from the first byte) or ldap://dc:389, which is ALWAYS upgraded with StartTLS -
+  # there is no cleartext mode (the users' passwords would cross the network in clear)
+  cursrv() { "$NODE" -e 'const l=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ldap||{};console.log((l.servers||[]).map(s=>typeof s==="string"?s:s.url).join(","))' "$CFG"; }
+  oksrv() { local x; IFS=',' read -ra L <<<"$1"; [ ${#L[@]} -ge 1 ] && [ ${#L[@]} -le 4 ] || return 1
+    for x in "${L[@]}"; do x="${x// /}"; [[ "$x" =~ ^ldaps?://[A-Za-z0-9.-]+(:[0-9]{2,5})?$ ]] || return 1; done; }
+  echo "    Directory servers: ldaps://dc:636, or ldap://dc:389 (port 389 is upgraded to TLS with StartTLS - still encrypted)."
+  echo "    Use the DC's full name (it must match its certificate). Several: separate with commas, first one is tried first."
+  C0="$(cursrv)"
+  while :; do flush; read -r -p "    directory server(s) [Enter keeps: ${C0:-none}]: " SV || true; SV="${SV:-$C0}"; SV="${SV// /}"
+    oksrv "$SV" && break; echo "      use ldaps://dc.asic-hq.com:636 or ldap://dc.asic-hq.com:389 (1 to 4, comma-separated) - try again" >&2; done
+  echo
   B="$(readdn bind 'service account DN')"; echo
   GA="$(readdn admin 'admin    group DN (e.g. SOC-Admins)')"; echo
   GO="$(readdn operator 'operator group DN (e.g. SOC-Analysts)')"; echo
   GV="$(readdn viewer 'viewer   group DN (e.g. SOC-Viewers)')"; echo
   BAK="$CFG.bak-$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$BAK"; echo "    backup: $BAK"
-  ZB="$B" ZA="$GA" ZO="$GO" ZV="$GV" "$NODE" -e '
+  ZS="$SV" ZB="$B" ZA="$GA" ZO="$GO" ZV="$GV" "$NODE" -e '
     const fs=require("fs"), f=process.argv[1], c=JSON.parse(fs.readFileSync(f,"utf8")), e=process.env;
     if (new Set([e.ZA,e.ZO,e.ZV].map(s=>s.toLowerCase())).size!==3) { console.error("    the three groups must be different - nothing changed"); process.exit(1); }
+    const old=(c.ldap.servers||[]).map(s=>typeof s==="string"?{url:s}:s);
+    c.ldap.servers=e.ZS.split(",").filter(Boolean).map(u=>{const k=old.find(o=>o.url===u);return k&&Object.keys(k).length>1?k:u;});
     c.ldap.bindDN=e.ZB; c.ldap.groupRoles={[e.ZA]:"admin",[e.ZO]:"operator",[e.ZV]:"viewer"};
     const st=fs.statSync(f), t=f+".tmp-"+process.pid;
     fs.writeFileSync(t, JSON.stringify(c,null,2)+"\n", {mode:st.mode&0o777}); fs.chownSync(t, st.uid, st.gid); fs.renameSync(t,f);' "$CFG" \
