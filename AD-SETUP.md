@@ -12,7 +12,7 @@ checked by AD and is never stored or logged. Two-step verification (authenticato
 | UPN suffix | `asic-hq.com` (accepted as `user@asic-hq.com`) |
 | Domain controller | `asdc-hqa.asic-hq.com` (192.168.12.52) → `ldaps://asdc-hqa.asic-hq.com:636` |
 | Issuing CA | "Asic Microsoft CA" (root, CA server AS-CA01) → `/etc/ssl/asic-hq/asic-microsoft-ca.pem` |
-| Service account | `svc-zyberon-ldap` (Domain Users only) |
+| Service account | `svc-zyberon-ldap` in the examples (Domain Users only) - Arabian Shield uses `zmonitor.ad`: put its real DN in `bindDN` |
 | Role groups | `SOC-Admins` → admin, `SOC-Analysts` → operator, `SOC-Viewers` → viewer (names/DNs configurable) |
 
 `soc.der3.com` is only the portal's web name — it has nothing to do with the AD domain.

@@ -1,7 +1,7 @@
 'use strict';
 // setup-ad-signin.sh driven through a pseudo-terminal (tests/setup-ad-signin-pty.py) against a temporary config and the real
 // as-auth-ldap.js: --init adds the block once, a malformed DN is refused and asked again, Enter keeps a value, the config is
-// backed up and keeps its mode, the connection check failing (no DC here) stops the script with AD sign-in still OFF.
+// backed up and keeps its mode, the prompts name the configured service account (not the example), the connection check failing (no DC here) stops the script with AD sign-in still OFF.
 // SYNTHETIC config only. Run: node --test tests/setup-ad-signin.test.js
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('fs'), os = require('os'), path = require('path'), { spawnSync } = require('child_process');
 const ROOT = path.join(__dirname, '..');
@@ -13,6 +13,8 @@ test('guided AD setup: DNs validated and saved, check failure leaves AD sign-in 
   const B = 'CN=svc-syn,OU=Service Accounts,DC=asic-hq,DC=com', A = 'CN=SYN-Admins,OU=Groups,DC=asic-hq,DC=com';
   const r = spawnSync('python3', [path.join(__dirname, 'setup-ad-signin-pty.py'), S, 'y', 'not a dn', B, A, '', '', 'y', 'n'], { encoding: 'utf8', timeout: 90000 });
   const outp = r.stdout || '';
+  assert.match(outp, /the built-in example\. If yours is another account \(e\.g\. zmonitor\.ad\)/, 'the example service account is pointed out');
+  assert.match(outp, /type \(or replace\) the svc-syn password now\?/, 'the password prompt names the configured service account');
   assert.match(outp, /not a DN like/, 'a malformed DN is refused'); assert.match(outp, /backup: /); assert.match(outp, /\[FAIL\]/);
   assert.match(outp, /AD sign-in is still off/); assert.match(outp, /EXIT 1/);
   const c = JSON.parse(fs.readFileSync(S + '/cfg.json', 'utf8'));

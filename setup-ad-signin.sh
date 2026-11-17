@@ -60,12 +60,15 @@ show() { "$NODE" -e '
   console.log("    servers         : "+(l.servers||[]).map(s=>typeof s==="string"?s:s.url+(s.ip?" ("+s.ip+")":"")).join(", "));
   console.log("    service account : "+(l.bindDN||"(not set)")+"   password "+(l.bindPassword?"stored (encrypted)":"NOT set"));
   for (const [dn,r] of Object.entries(l.groupRoles||{})) console.log("    "+r.padEnd(8)+" group  : "+dn);' "$CFG"; }
+# the service account's name, from the DN in the config (CN=<name>,...) - whichever account Arabian Shield uses (zmonitor.ad, ...)
+svcname() { "$NODE" -e 'const l=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ldap||{};const m=/^CN=([^,]+)/i.exec(l.bindDN||"");console.log(m?m[1]:"the service account")' "$CFG"; }
 show
 echo
-echo "    On a DC (PowerShell) these give the exact values:"
-echo "      Get-ADUser svc-zyberon-ldap | Select DistinguishedName"
+if [ "$(svcname)" = svc-zyberon-ldap ]; then echo "    NOTE: the service account above is the built-in example. If yours is another account (e.g. zmonitor.ad), answer y below and enter its DN."; fi
+echo "    On a DC (PowerShell) these give the exact values (use your service account's logon name):"
+echo "      Get-ADUser zmonitor.ad | Select DistinguishedName"
 echo "      Get-ADGroup -Filter 'Name -like \"SOC-*\"' | Select Name, DistinguishedName"
-if ask "    change any of them?" n; then
+if ask "    change any of them?" "$( [ "$(svcname)" = svc-zyberon-ldap ] && echo y || echo n )"; then
   cur() { "$NODE" -e '
     const l=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ldap||{}, w=process.argv[2];
     if (w==="bind") console.log(l.bindDN||""); else console.log(Object.keys(l.groupRoles||{}).find(k=>l.groupRoles[k]===w)||"");' "$CFG" "$1"; }
@@ -106,7 +109,7 @@ fi
 
 # ---------------------------------------------------------------- 4. service password
 say "4/6  service account password"
-if ask "    type (or replace) the svc-zyberon-ldap password now? It is tested against AD, then stored encrypted" \
+if ask "    type (or replace) the $(svcname) password now? It is tested against AD, then stored encrypted" \
      "$("$NODE" -e 'const l=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ldap||{};console.log(l.bindPassword?"n":"y")' "$CFG")"; then
   tool --set-bind-password || die "the password was not stored (wrong password, or the DC cannot be reached - --check below shows which)"
 fi
